@@ -1,0 +1,5 @@
+```
+feedparser>=6.0.10
+geoip2>=4.7.0
+requests>=2.31.0
+```
