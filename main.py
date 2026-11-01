@@ -6,6 +6,9 @@ import geoip2.database
 import json
 import os
 import re
+import sys
+import uuid
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 # Configure logging
@@ -13,54 +16,61 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Constants
 DEFAULT_GEOIP_DB = 'GeoLite2-City.mmdb'
-GEOIP_DB_URL = "https://geolite.maxmind.com/download/geoip/database/GeoLite2-City.tar.gz"
 
-def download_geoip_db(db_path):
-    """Downloads and extracts the GeoLite2-City database if it doesn't exist."""
-    if not os.path.exists(db_path):
-        logging.info("GeoIP database not found. Downloading...")
+def _validate_tar_members(tar, target_dir):
+    base = os.path.abspath(target_dir)
+    for member in tar.getmembers():
+        dest = os.path.abspath(os.path.join(base, member.name))
+        if dest != base and not dest.startswith(base + os.sep):
+            raise ValueError(f"Refusing archive member outside the target directory: {member.name}")
+        if member.issym() or member.islnk():
+            link_dest = os.path.abspath(os.path.join(base, os.path.dirname(member.name), member.linkname))
+            if not link_dest.startswith(base + os.sep):
+                raise ValueError(f"Refusing archive link member outside the target directory: {member.name}")
+
+def extract_geoip_archive(archive_path, target_dir):
+    """Extracts an archive only after every member path is validated."""
+    import tarfile
+    with tarfile.open(archive_path, "r:gz") as tar:
+        _validate_tar_members(tar, target_dir)
         try:
-            import tarfile
-            response = requests.get(GEOIP_DB_URL, stream=True)
-            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+            tar.extractall(path=target_dir, filter="data")
+        except TypeError:
+            tar.extractall(path=target_dir)
 
-            with open("GeoLite2-City.tar.gz", "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            logging.info("Extracting GeoIP database...")
-            with tarfile.open("GeoLite2-City.tar.gz", "r:gz") as tar:
-                # Find the directory to extract from
-                db_dir = next((member.name for member in tar.getmembers() if member.isdir() and "GeoLite2-City_" in member.name), None)
-                if not db_dir:
-                    raise Exception("Could not find GeoLite2-City directory in the archive.")
-
-                # Extract the specific database file to the current directory
-                tar.extract(f"{db_dir}/GeoLite2-City.mmdb", path=".")
-
-            # Rename the extracted file to the expected name
-            extracted_db_path = os.path.join(db_dir, "GeoLite2-City.mmdb")
-            os.rename(extracted_db_path, db_path)
-
-
-            os.remove("GeoLite2-City.tar.gz")  # Remove the tar.gz file
-
-            # Clean up the extraction directory
-            import shutil
-            shutil.rmtree(db_dir, ignore_errors=True)
-
-
-            logging.info("GeoIP database downloaded and extracted successfully.")
-
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error downloading GeoIP database: {e}")
-            raise
-        except tarfile.ReadError as e:
-             logging.error(f"Error extracting GeoIP database: {e}")
-             raise
-        except Exception as e:
-            logging.error(f"An unexpected error occurred during GeoIP download/extraction: {e}")
-            raise
+def download_geoip_db(db_path, url):
+    """Downloads and extracts a GeoIP database from an operator supplied URL."""
+    logging.info(f"Downloading GeoIP database from operator supplied URL: {url}")
+    try:
+        import tarfile
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
+        archive_path = "GeoLite2-City.tar.gz"
+        with open(archive_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        logging.info("Extracting GeoIP database...")
+        extract_dir = "geoip_extract"
+        os.makedirs(extract_dir, exist_ok=True)
+        extract_geoip_archive(archive_path, extract_dir)
+        found = None
+        for root, _dirs, files in os.walk(extract_dir):
+            for name in files:
+                if name.endswith(".mmdb"):
+                    found = os.path.join(root, name)
+                    break
+            if found:
+                break
+        if not found:
+            raise Exception("No .mmdb file found in the GeoIP archive.")
+        os.rename(found, db_path)
+        os.remove(archive_path)
+        import shutil
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        logging.info("GeoIP database downloaded and extracted successfully.")
+    except Exception as e:
+        logging.error(f"Error downloading or extracting GeoIP database: {e}")
+        raise
 
 def is_valid_url(url):
     """
@@ -79,7 +89,8 @@ def setup_argparse():
     parser.add_argument("-f", "--format", choices=["stix", "misp", "text", "json"], default="text", help="Output format for the IOCs (default: text)")
     parser.add_argument("-o", "--output", help="Output file to save the converted IOCs. If not specified, prints to stdout.", required=False)
     parser.add_argument("-g", "--geoip", action="store_true", help="Enable GeoIP lookup for IP addresses.")
-    parser.add_argument("--geoip_db", default=DEFAULT_GEOIP_DB, help=f"Path to the GeoIP database. Defaults to '{DEFAULT_GEOIP_DB}'. Will download if not found.")
+    parser.add_argument("--geoip_db", default=DEFAULT_GEOIP_DB, help=f"Path to the GeoIP database. Defaults to '{DEFAULT_GEOIP_DB}'. No download happens unless --geoip-url is also supplied.")
+    parser.add_argument("--geoip-url", dest="geoip_url", default=None, help="Operator supplied URL of a GeoIP database archive (for example a MaxMind GeoLite2 archive the operator is licensed to download). Used only when the database file is missing.")
     parser.add_argument("-i", "--ioc_type", choices=["ip", "domain", "url", "hash"], help="Filter IOCs by type.")
     parser.add_argument("-r", "--regex", help="Filter IOCs by a regular expression.", required=False)
 
@@ -103,18 +114,16 @@ def fetch_feed(url):
             # Treat as a local file
             try:
                 with open(url, 'r') as f:
-                    try:
-                        # Attempt to parse as JSON
-                        return json.load(f)
-                    except json.JSONDecodeError:
-                        # If JSON parsing fails, assume it's a feed
-                        # The fallback cannot work as written: json.load
-                        # already consumed the file, so f.read() returns
-                        # an empty string and the parser gets nothing. A
-                        # local RSS or Atom file therefore yields zero
-                        # IOCs, while the same feed fetched by URL works,
-                        # because that branch re-reads response.content.
-                        return feedparser.parse(f.read())
+                    content = f.read()
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    parsed = feedparser.parse(content)
+                    if getattr(parsed, "entries", None):
+                        return parsed
+                    # Plain text feed: return the raw text so its lines
+                    # are parsed for indicators instead of dropped.
+                    return content
             except FileNotFoundError:
                 logging.error(f"File not found: {url}")
                 return None
@@ -159,6 +168,12 @@ def extract_iocs(feed_data):
               for item in data:
                   extract_from_dict(item)
         extract_from_dict(feed_data) # run the extraction
+
+    elif isinstance(feed_data, str):  # Plain text feed
+        iocs["ip"] = re.findall(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}", feed_data)
+        iocs["domain"] = re.findall(r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", feed_data)
+        iocs["url"] = re.findall(r"http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+", feed_data)
+        iocs["hash"] = re.findall(r"\b[a-fA-F0-9]{32,128}\b", feed_data)
 
     elif hasattr(feed_data, 'entries'):  # RSS/Atom feed
         for entry in feed_data.entries:
@@ -261,12 +276,43 @@ def convert_to_format(iocs, output_format, geoip_enabled, geoip_db_path):
                         if location_data:
                             iocs[ioc_type][i] = {"ip": ioc_list[i], "location": location_data}
         output = json.dumps(iocs, indent=4)
-    elif output_format in ("stix", "misp"):
-        # Neither format is actually produced: the output is a plain
-        # text disclaimer followed by the JSON dump. Anything that
-        # asked for STIX or MISP and parses the result as such fails,
-        # and this text gives it no machine readable sign why.
-        output = f"Format {output_format.upper()} not yet fully implemented.\nRaw IOC data:\n{json.dumps(iocs, indent=4)}"
+    elif output_format == "stix":
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        patterns = {"ip": ("ipv4-addr", "value"), "domain": ("domain-name", "value"), "url": ("url", "value")}
+        hash_names = {32: "MD5", 40: "SHA-1", 64: "SHA-256"}
+        objects = []
+        for ioc_type, ioc_list in iocs.items():
+            for value in ioc_list:
+                if isinstance(value, dict):
+                    value = value.get("ip", "")
+                if not value:
+                    continue
+                if ioc_type == "hash":
+                    algo = hash_names.get(len(value), "SHA-256")
+                    pattern = f"[file:hashes.'{algo}' = '{value}']"
+                else:
+                    stix_type = patterns.get(ioc_type, ("artifact", "url"))[0]
+                    pattern = f"[{stix_type}:value = '{value}']"
+                objects.append({"type": "indicator", "spec_version": "2.1", "id": f"indicator--{uuid.uuid4()}", "created": now, "modified": now, "name": str(value), "pattern": pattern, "pattern_type": "stix", "valid_from": now})
+        bundle = {"type": "bundle", "id": f"bundle--{uuid.uuid4()}", "objects": objects}
+        output = json.dumps(bundle, indent=4)
+    elif output_format == "misp":
+        type_map = {"ip": ("Network activity", "ip-dst"), "domain": ("Network activity", "domain"), "url": ("Network activity", "url")}
+        hash_types = {32: "md5", 40: "sha1", 64: "sha256"}
+        attributes = []
+        for ioc_type, ioc_list in iocs.items():
+            for value in ioc_list:
+                if isinstance(value, dict):
+                    value = value.get("ip", "")
+                if not value:
+                    continue
+                if ioc_type == "hash":
+                    category, attr_type = "Payload delivery", hash_types.get(len(value), "sha256")
+                else:
+                    category, attr_type = type_map.get(ioc_type, ("Network activity", "text"))
+                attributes.append({"category": category, "type": attr_type, "value": str(value)})
+        event = {"Event": {"info": "Converted feed indicators", "distribution": "0", "threat_level_id": "2", "analysis": "0", "Attribute": attributes}}
+        output = json.dumps(event, indent=4)
     else:
         logging.error(f"Unsupported output format: {output_format}")
         return None
@@ -280,38 +326,43 @@ def main():
 
     if not args.url:
       parser.print_help()
-      return
+      sys.exit(2)
 
+    feed_data = fetch_feed(args.url)
 
-    try:
-        feed_data = fetch_feed(args.url)
+    if not feed_data:
+        logging.error("Failed to fetch or parse the threat intelligence feed.")
+        sys.exit(1)
 
-        if feed_data:
-            iocs = extract_iocs(feed_data)
-            filtered_iocs = filter_iocs(iocs, args.ioc_type, args.regex)
+    iocs = extract_iocs(feed_data)
+    filtered_iocs = filter_iocs(iocs, args.ioc_type, args.regex)
 
-            if args.geoip and not os.path.exists(args.geoip_db):
-               download_geoip_db(args.geoip_db)
-
-            output = convert_to_format(filtered_iocs, args.format, args.geoip, args.geoip_db)
-
-            if output:
-                if args.output:
-                    try:
-                        with open(args.output, "w") as f:
-                            f.write(output)
-                        logging.info(f"IOCs saved to {args.output}")
-                    except Exception as e:
-                        logging.error(f"Error writing to output file: {e}")
-                else:
-                    print(output)
-            else:
-                logging.warning("No output generated.")
+    if args.geoip and not os.path.exists(args.geoip_db):
+        if args.geoip_url:
+            try:
+                download_geoip_db(args.geoip_db, args.geoip_url)
+            except Exception:
+                sys.exit(1)
         else:
-            logging.error("Failed to fetch or parse the threat intelligence feed.")
+            logging.error(f"GeoIP database not found at {args.geoip_db} and no --geoip-url was supplied. No download was attempted. Supply --geoip-db with an existing database or --geoip-url with an archive URL.")
+            sys.exit(1)
 
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
+    output = convert_to_format(filtered_iocs, args.format, args.geoip, args.geoip_db)
+
+    if not output:
+        logging.error("No output generated.")
+        sys.exit(1)
+
+    if args.output:
+        try:
+            with open(args.output, "w") as f:
+                f.write(output)
+            logging.info(f"IOCs saved to {args.output}")
+        except Exception as e:
+            logging.error(f"Error writing to output file: {e}")
+            sys.exit(1)
+    else:
+        print(output)
 
 if __name__ == "__main__":
     main()
