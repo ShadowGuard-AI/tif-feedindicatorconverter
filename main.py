@@ -108,6 +108,12 @@ def fetch_feed(url):
                         return json.load(f)
                     except json.JSONDecodeError:
                         # If JSON parsing fails, assume it's a feed
+                        # The fallback cannot work as written: json.load
+                        # already consumed the file, so f.read() returns
+                        # an empty string and the parser gets nothing. A
+                        # local RSS or Atom file therefore yields zero
+                        # IOCs, while the same feed fetched by URL works,
+                        # because that branch re-reads response.content.
                         return feedparser.parse(f.read())
             except FileNotFoundError:
                 logging.error(f"File not found: {url}")
@@ -173,6 +179,9 @@ def extract_iocs(feed_data):
             iocs["hash"].extend(hashes)
 
     #Remove Duplicates
+    # Sets also throw away the feed's own ordering and any count of
+    # how often an indicator appeared, which in a feed is often the
+    # only signal of how widely it was reported.
     for key in iocs:
         iocs[key] = list(set(iocs[key]))
 
@@ -253,6 +262,10 @@ def convert_to_format(iocs, output_format, geoip_enabled, geoip_db_path):
                             iocs[ioc_type][i] = {"ip": ioc_list[i], "location": location_data}
         output = json.dumps(iocs, indent=4)
     elif output_format in ("stix", "misp"):
+        # Neither format is actually produced: the output is a plain
+        # text disclaimer followed by the JSON dump. Anything that
+        # asked for STIX or MISP and parses the result as such fails,
+        # and this text gives it no machine readable sign why.
         output = f"Format {output_format.upper()} not yet fully implemented.\nRaw IOC data:\n{json.dumps(iocs, indent=4)}"
     else:
         logging.error(f"Unsupported output format: {output_format}")
